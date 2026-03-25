@@ -1,14 +1,17 @@
-local SpooferState = {
+-- Spoofer Module
+local Spoofer = {}
+
+Spoofer.State = {
     Enabled = false,
     Clone = nil,
     JointMap = {},
     UpdateCount = 0
 }
 
-local function createSpooferClone()
-    if SpooferState.Clone then
-        pcall(function() SpooferState.Clone:Destroy() end)
-        SpooferState.Clone = nil
+function Spoofer.createClone()
+    if Spoofer.State.Clone then
+        pcall(function() Spoofer.State.Clone:Destroy() end)
+        Spoofer.State.Clone = nil
     end
     
     local currentChar = game.Players.LocalPlayer.Character
@@ -62,14 +65,14 @@ local function createSpooferClone()
     highlight.OutlineTransparency = 0
     
     clone.Parent = workspace
-    SpooferState.Clone = clone
+    Spoofer.State.Clone = clone
     
-    SpooferState.JointMap = {}
+    Spoofer.State.JointMap = {}
     for _, cloneJoint in pairs(clone:GetDescendants()) do
         if cloneJoint:IsA("Motor6D") then
             local realJoint = currentChar:FindFirstChild(cloneJoint.Name, true)
             if realJoint and realJoint:IsA("Motor6D") then
-                SpooferState.JointMap[cloneJoint] = realJoint
+                Spoofer.State.JointMap[cloneJoint] = realJoint
             end
         end
     end
@@ -77,43 +80,43 @@ local function createSpooferClone()
     return true
 end
 
-local function updateSpoofer()
+function Spoofer.update()
     if not getgenv().Settings.Spoofer then
-        if SpooferState.Clone then
-            pcall(function() SpooferState.Clone:Destroy() end)
-            SpooferState.Clone = nil
+        if Spoofer.State.Clone then
+            pcall(function() Spoofer.State.Clone:Destroy() end)
+            Spoofer.State.Clone = nil
         end
         return
     end
     
-    local shouldWork = (getgenv().Settings.AutoKill and lockedTarget) or getgenv().Settings.VoidWalk
+    local shouldWork = (getgenv().Settings.AutoKill and getgenv().lockedTarget) or getgenv().Settings.VoidWalk
     
     if not shouldWork then
-        if SpooferState.Clone and SpooferState.Clone.Parent then
-            SpooferState.Clone:Destroy()
-            SpooferState.Clone = nil
+        if Spoofer.State.Clone and Spoofer.State.Clone.Parent then
+            Spoofer.State.Clone:Destroy()
+            Spoofer.State.Clone = nil
         end
         return
     end
     
-    if not SpooferState.Clone or not SpooferState.Clone.Parent then
-        local success = createSpooferClone()
+    if not Spoofer.State.Clone or not Spoofer.State.Clone.Parent then
+        local success = Spoofer.createClone()
         if not success then return end
     end
     
-    if not SpooferState.Clone then return end
+    if not Spoofer.State.Clone then return end
     
-    local cloneRoot = SpooferState.Clone:FindFirstChild("HumanoidRootPart")
+    local cloneRoot = Spoofer.State.Clone:FindFirstChild("HumanoidRootPart")
     if not cloneRoot then return end
     
-    if getgenv().Settings.AutoKill and lockedTarget then
+    if getgenv().Settings.AutoKill and getgenv().lockedTarget then
         local targetChar = nil
-        if typeof(lockedTarget) == "Instance" and lockedTarget:IsA("Player") then
-            targetChar = lockedTarget.Character
+        if typeof(getgenv().lockedTarget) == "Instance" and getgenv().lockedTarget:IsA("Player") then
+            targetChar = getgenv().lockedTarget.Character
         else
             if getgenv().Settings.TargetName then
                 local recovered = game.Players:FindFirstChild(getgenv().Settings.TargetName)
-                lockedTarget = recovered
+                getgenv().lockedTarget = recovered
                 if recovered then targetChar = recovered.Character end
             end
         end
@@ -132,14 +135,14 @@ local function updateSpoofer()
         )
     end
     
-    for cloneJoint, realJoint in pairs(SpooferState.JointMap) do
+    for cloneJoint, realJoint in pairs(Spoofer.State.JointMap) do
         if realJoint and realJoint.Parent and cloneJoint and cloneJoint.Parent then
             cloneJoint.Transform = realJoint.Transform
         end
     end
     
     local realChar = game.Players.LocalPlayer.Character
-    local clone = SpooferState.Clone
+    local clone = Spoofer.State.Clone
     if realChar and clone then
         local realTool = realChar:FindFirstChildOfClass("Tool")
         local cloneTool = clone:FindFirstChildOfClass("Tool")
@@ -194,40 +197,38 @@ local function updateSpoofer()
         end
     end
     
-    local shouldShow = (getgenv().Settings.AutoKill and lockedTarget) or getgenv().Settings.VoidWalk
-    for _, part in pairs(SpooferState.Clone:GetDescendants()) do
+    local shouldShow = (getgenv().Settings.AutoKill and getgenv().lockedTarget) or getgenv().Settings.VoidWalk
+    for _, part in pairs(Spoofer.State.Clone:GetDescendants()) do
         if part:IsA("BasePart") then
             part.Transparency = shouldShow and 0.5 or 1
         end
     end
     
-    local highlight = SpooferState.Clone:FindFirstChildOfClass("Highlight")
+    local highlight = Spoofer.State.Clone:FindFirstChildOfClass("Highlight")
     if highlight then
         highlight.Enabled = shouldShow
     end
 end
 
-local spooferUpdateConnection = nil
-
-local function startSpooferUpdate()
-    if spooferUpdateConnection then
-        spooferUpdateConnection:Disconnect()
+function Spoofer.startUpdate()
+    if Spoofer.updateConnection then
+        Spoofer.updateConnection:Disconnect()
     end
-    spooferUpdateConnection = game:GetService("RunService").Heartbeat:Connect(updateSpoofer)
+    Spoofer.updateConnection = game:GetService("RunService").Heartbeat:Connect(Spoofer.update)
 end
 
-local function stopSpooferUpdate()
-    if spooferUpdateConnection then
-        spooferUpdateConnection:Disconnect()
-        spooferUpdateConnection = nil
+function Spoofer.stopUpdate()
+    if Spoofer.updateConnection then
+        Spoofer.updateConnection:Disconnect()
+        Spoofer.updateConnection = nil
     end
-    if SpooferState.Clone then
-        pcall(function() SpooferState.Clone:Destroy() end)
-        SpooferState.Clone = nil
+    if Spoofer.State.Clone then
+        pcall(function() Spoofer.State.Clone:Destroy() end)
+        Spoofer.State.Clone = nil
     end
 end
 
-local function setupSpooferUI(PlayerGroup)
+function Spoofer.setupUI(PlayerGroup)
     local SpooferToggle = PlayerGroup:AddToggle('SpooferToggle', {
         Text = 'Spoofer', Default = false,
         Tooltip = 'Create a clone that attacks target while you stay hidden',
@@ -235,13 +236,15 @@ local function setupSpooferUI(PlayerGroup)
             getgenv().Settings.Spoofer = Value
             if Value then
                 task.spawn(function()
-                    createSpooferClone()
-                    startSpooferUpdate()
+                    Spoofer.createClone()
+                    Spoofer.startUpdate()
                 end)
             else
-                stopSpooferUpdate()
+                Spoofer.stopUpdate()
             end
         end
     })
     return SpooferToggle
 end
+
+return Spoofer
