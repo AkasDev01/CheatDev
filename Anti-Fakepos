@@ -1,0 +1,576 @@
+-- ===================== ANTI FAKEPOS MODULE =====================
+-- Phát hiện và xử lý fake position (vị trí ảo) của target
+-- Dùng để bắn trúng target khi họ đang dùng fake pos
+
+local function clamp(x, a, b)
+    return math.max(a, math.min(b, x))
+end
+
+local function safeUnit(v)
+    local mag = v.Magnitude
+    if mag > 1e-6 then return v / mag end
+    return Vector3.zero
+end
+
+local function xz(v)
+    return Vector3.new(v.X, 0, v.Z)
+end
+
+local function magXZ(v)
+    return math.sqrt(v.X * v.X + v.Z * v.Z)
+end
+
+local function getRootAndHumanoid(player)
+    if not player or not player.Character then return nil, nil end
+    local character = player.Character
+    return character:FindFirstChild("HumanoidRootPart"), character:FindFirstChild("Humanoid")
+end
+
+local function getAirState(humanoid)
+    if not humanoid then return "Unknown" end
+    local state = humanoid:GetState()
+    if state == Enum.HumanoidStateType.Jumping then return "Jumping"
+    elseif state == Enum.HumanoidStateType.Freefall then return "Freefall"
+    elseif state == Enum.HumanoidStateType.Landed then return "Landed"
+    elseif state == Enum.HumanoidStateType.Climbing then return "Climbing"
+    elseif state == Enum.HumanoidStateType.Running
+        or state == Enum.HumanoidStateType.RunningNoPhysics
+        or state == Enum.HumanoidStateType.StrafingNoPhysics then return "Grounded"
+    end
+    return tostring(state.Name)
+end
+
+local function getHumanoidStateScore(humanoid)
+    if not humanoid then return 1.0 end
+    local state = humanoid:GetState()
+    local moveDir = humanoid.MoveDirection
+    local isMoving = moveDir.Magnitude > 0.1
+    local floorMaterial = humanoid.FloorMaterial
+    local stateScores = {
+        [Enum.HumanoidStateType.Dead] = 0.30,
+        [Enum.HumanoidStateType.Ragdoll] = 0.50,
+        [Enum.HumanoidStateType.Freefall] = 0.78,
+        [Enum.HumanoidStateType.Jumping] = 0.92,
+        [Enum.HumanoidStateType.Running] = 1.00,
+        [Enum.HumanoidStateType.RunningNoPhysics] = 0.96,
+        [Enum.HumanoidStateType.StrafingNoPhysics] = 0.96,
+        [Enum.HumanoidStateType.Climbing] = 0.84,
+        [Enum.HumanoidStateType.Seated] = 0.88,
+        [Enum.HumanoidStateType.PlatformStanding] = 0.80,
+        [Enum.HumanoidStateType.FallingDown] = 0.60,
+        [Enum.HumanoidStateType.GettingUp] = 0.72,
+        [Enum.HumanoidStateType.Landed] = 0.92,
+    }
+    local score = stateScores[state] or 0.82
+    if isMoving then score = score * 1.04 end
+    if floorMaterial == Enum.Material.Ice or floorMaterial == Enum.Material.Snow then
+        score = score * 0.96
+    end
+    return clamp(score, 0.25, 1.0)
+end
+
+local function buildInfo(data, override)
+    override = override or {}
+    return {
+        trust = override.trust or (data and data.lastTrust or 0),
+        trustXZ = override.trustXZ or (data and data.lastTrustXZ or 0),
+        trustY = override.trustY or (data and data.lastTrustY or 0),
+        stable = override.stable ~= nil and override.stable or ((data and data.stableFrames or 0) > 5),
+        suspicious = override.suspicious ~= nil and override.suspicious or ((data and data.suspiciousFrames or 0) > 3),
+        snapScore = override.snapScore or (data and data.lastSnapScore or 0),
+        raycastTrust = override.raycastTrust or (data and data.lastRaycastValid or 1),
+        airState = override.airState or (data and data.lastAirState or "Unknown"),
+        isLikelyFakePos = override.isLikelyFakePos ~= nil and override.isLikelyFakePos or (data and data.lastLikelyFakePos or false),
+        anomalies = override.anomalies or {},
+        ping = override.ping or 0,
+        historySize = override.historySize or (data and data.history and #data.history or 0),
+    }
+end
+
+local function calculateRobustVelocity(history, window, config)
+    if #history < 2 then return Vector3.zero, Vector3.zero, 0 end
+    window = window or 4
+    local currentTime = history[#history].time
+    local startIdx = math.max(1, #history - window)
+    local segments = {}
+    for i = startIdx + 1, #history do
+        local a = history[i - 1]
+        local b = history[i]
+        local dt = b.time - a.time
+        if dt > config.MinSampleDt and dt < config.MaxSampleDt then
+            local delta = b.pos - a.pos
+            local speed = delta.Magnitude / dt
+            if speed < config.MaxSpeedOutlier then
+                table.insert(segments, {
+                    vel = delta / dt,
+                    velXZ = xz(delta) / dt,
+                    velY = delta.Y / dt,
+                    speed = speed,
+                    trust = a.trust * b.trust,
+                    time = b.time
+                })
+            end
+        end
+    end
+    if #segments == 0 then return Vector3.zero, Vector3.zero, 0 end
+    table.sort(segments, function(x, y) return x.speed < y.speed end)
+    local trim = math.min(math.floor(#segments * 0.2), math.max(0, #segments - 2))
+    local sum3 = Vector3.zero
+    local sumXZ = Vector3.zero
+    local sumY = 0
+    local total = 0
+    for i = trim + 1, #segments - trim do
+        local s = segments[i]
+        local age = currentTime - s.time
+        local recency = math.exp(-age * 9)
+        local weight = math.max(0.05, s.trust) * recency
+        sum3 = sum3 + s.vel * weight
+        sumXZ = sumXZ + s.velXZ * weight
+        sumY = sumY + s.velY * weight
+        total = total + weight
+    end
+    if total <= 0 then return Vector3.zero, Vector3.zero, 0 end
+    return sum3 / total, sumXZ / total, sumY / total
+end
+
+local function validatePositionWithRaycast(player, fromPos, toPos, humanoid)
+    if not player.Character then return 1.0 end
+    local delta = toPos - fromPos
+    local distance = delta.Magnitude
+    if distance < 5 then return 1.0 end
+    local vertical = math.abs(delta.Y)
+    local airState = getAirState(humanoid)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Blacklist
+    params.FilterDescendantsInstances = {player.Character}
+    params.IgnoreWater = true
+    local result = Workspace:Raycast(fromPos, delta, params)
+    local stateSoftener = 1.0
+    if airState == "Jumping" or airState == "Freefall" or airState == "Climbing" then
+        stateSoftener = 1.15
+    end
+    if not result then
+        if distance < 20 then return 0.95
+        elseif distance < 35 then return 0.78
+        elseif distance < 55 then return 0.58
+        else return 0.35
+        end
+    end
+    local hitDistance = (result.Position - fromPos).Magnitude
+    local ratio = hitDistance / math.max(distance, 0.001)
+    local base
+    if ratio > 0.95 then base = 0.88
+    elseif ratio > 0.70 then base = 0.68
+    elseif ratio > 0.35 then base = 0.48
+    else base = 0.28
+    end
+    if vertical > 6 then base = base * stateSoftener end
+    return clamp(base, 0.2, 1.0)
+end
+
+local function detectSnapLoop(history)
+    if #history < 4 then return 0, false end
+    local score = 0
+    local detected = false
+    local h1 = history[#history - 3]
+    local h2 = history[#history - 2]
+    local h3 = history[#history - 1]
+    local h4 = history[#history]
+    local d12 = (h2.pos - h1.pos).Magnitude
+    local d23 = (h3.pos - h2.pos).Magnitude
+    local d34 = (h4.pos - h3.pos).Magnitude
+    local return13 = (h3.pos - h1.pos).Magnitude
+    local return24 = (h4.pos - h2.pos).Magnitude
+    if d12 > 18 and return13 < d12 * 0.45 then
+        score = score + clamp((d12 - 18) / 30, 0, 1)
+        detected = true
+    end
+    if d23 > 14 and d34 > 14 and return24 < math.max(d23, d34) * 0.5 then
+        score = score + 0.6
+        detected = true
+    end
+    local zoneRadius = 8
+    if return13 < zoneRadius and d12 > 12 and d23 > 12 then
+        score = score + 0.5
+        detected = true
+    end
+    return clamp(score, 0, 1.5), detected
+end
+
+local function analyzeMovementPattern(history, player, config)
+    if #history < config.MinSamples then return 1.0, 1.0, 1.0, {}, 0, false end
+    local root, humanoid = getRootAndHumanoid(player)
+    if not root or not humanoid then return 0.5, 0.5, 0.5, {"NoCharacter"}, 0, false end
+    local trustXZ = 1.0
+    local trustY = 1.0
+    local anomalies = {}
+    local anomalyScores = {SpeedXZ=0, SpeedY=0, AccelXZ=0, AccelY=0, DirectionXZ=0, JitterXZ=0, SnapLoop=0}
+    local stateScore = getHumanoidStateScore(humanoid)
+    local airState = getAirState(humanoid)
+    local _, baseVelXZ, baseVelY = calculateRobustVelocity(history, 4, config)
+    local baseSpeedXZ = baseVelXZ.Magnitude
+    local baseSpeedY = math.abs(baseVelY)
+    local ping = player:GetNetworkPing()
+    local isAir = (airState == "Jumping" or airState == "Freefall" or airState == "Climbing")
+    for i = 3, #history do
+        local h1 = history[i - 2]
+        local h2 = history[i - 1]
+        local h3 = history[i]
+        local dt1 = h2.time - h1.time
+        local dt2 = h3.time - h2.time
+        if dt1 > config.MinSampleDt and dt1 < config.MaxSampleDt and dt2 > config.MinSampleDt and dt2 < config.MaxSampleDt then
+            local d1 = h2.pos - h1.pos
+            local d2 = h3.pos - h2.pos
+            if d2.Magnitude > config.MaxReasonableStep then
+                anomalyScores.SpeedXZ = anomalyScores.SpeedXZ + 0.8
+                anomalyScores.SpeedY = anomalyScores.SpeedY + 0.4
+                trustXZ = trustXZ - config.Weights.SpeedXZ * 0.8
+                trustY = trustY - config.Weights.SpeedY * 0.4
+            end
+            local v1 = d1 / dt1
+            local v2 = d2 / dt2
+            local v1XZ = xz(v1)
+            local v2XZ = xz(v2)
+            local speed1XZ = v1XZ.Magnitude
+            local speed2XZ = v2XZ.Magnitude
+            local speed1Y = math.abs(v1.Y)
+            local speed2Y = math.abs(v2.Y)
+            local maxExpectedSpeedXZ = config.BaseSpeedThresholdXZ * (1 + ping * 5.0)
+            if isAir then maxExpectedSpeedXZ = maxExpectedSpeedXZ * 1.10 end
+            if speed2XZ > maxExpectedSpeedXZ then
+                local severity = clamp((speed2XZ - maxExpectedSpeedXZ) / math.max(maxExpectedSpeedXZ, 1), 0, 1)
+                anomalyScores.SpeedXZ = anomalyScores.SpeedXZ + severity
+                trustXZ = trustXZ - config.Weights.SpeedXZ * severity
+            end
+            local maxExpectedSpeedY = config.BaseSpeedThresholdY * (1 + ping * 4.0)
+            if isAir then maxExpectedSpeedY = maxExpectedSpeedY * 1.25 end
+            if speed2Y > maxExpectedSpeedY then
+                local severity = clamp((speed2Y - maxExpectedSpeedY) / math.max(maxExpectedSpeedY, 1), 0, 1)
+                anomalyScores.SpeedY = anomalyScores.SpeedY + severity
+                trustY = trustY - config.Weights.SpeedY * severity
+            end
+            local avgDt = (dt1 + dt2) * 0.5
+            local accelXZ = (v2XZ - v1XZ).Magnitude / math.max(avgDt, 0.001)
+            local maxAccelXZ = 120 * (1 + baseSpeedXZ / 20)
+            if accelXZ > maxAccelXZ then
+                local severity = clamp((accelXZ - maxAccelXZ) / math.max(maxAccelXZ, 1), 0, 1)
+                anomalyScores.AccelXZ = anomalyScores.AccelXZ + severity
+                trustXZ = trustXZ - config.Weights.AccelXZ * severity
+            end
+            local accelY = math.abs(v2.Y - v1.Y) / math.max(avgDt, 0.001)
+            local maxAccelY = 180 * (1 + baseSpeedY / 25)
+            if isAir then maxAccelY = maxAccelY * 1.25 end
+            if accelY > maxAccelY then
+                local severity = clamp((accelY - maxAccelY) / math.max(maxAccelY, 1), 0, 1)
+                anomalyScores.AccelY = anomalyScores.AccelY + severity
+                trustY = trustY - config.Weights.AccelY * severity
+            end
+            if speed1XZ > 1 and speed2XZ > 1 then
+                local dir1 = safeUnit(v1XZ)
+                local dir2 = safeUnit(v2XZ)
+                local dot = dir1:Dot(dir2)
+                if dot < -0.82 and speed1XZ > 10 and speed2XZ > 10 then
+                    anomalyScores.DirectionXZ = anomalyScores.DirectionXZ + 1
+                    trustXZ = trustXZ - config.Weights.DirectionXZ
+                end
+                if i > 4 then
+                    local h0 = history[i - 3]
+                    local dt0 = h1.time - h0.time
+                    if dt0 > config.MinSampleDt and dt0 < config.MaxSampleDt then
+                        local v0XZ = xz((h1.pos - h0.pos) / dt0)
+                        if v0XZ.Magnitude > 5 then
+                            local dir0 = safeUnit(v0XZ)
+                            local prevDot = dir0:Dot(dir1)
+                            local currDot = dir1:Dot(dir2)
+                            if prevDot < -0.55 and currDot < -0.55 then
+                                anomalyScores.DirectionXZ = anomalyScores.DirectionXZ + 0.65
+                                trustXZ = trustXZ - config.Weights.DirectionXZ * 0.65
+                            end
+                        end
+                    end
+                end
+            end
+            if i > 3 then
+                local dispXZ = magXZ(h3.pos - h1.pos)
+                local pathXZ = magXZ(d1) + magXZ(d2)
+                if pathXZ > dispXZ * 2.2 and dispXZ < 12 then
+                    local severity = clamp((pathXZ / math.max(dispXZ, 1) - 1) / 2, 0, 1)
+                    anomalyScores.JitterXZ = anomalyScores.JitterXZ + severity
+                    trustXZ = trustXZ - config.Weights.JitterXZ * severity
+                end
+            end
+        end
+    end
+    local snapScore, snapDetected = detectSnapLoop(history)
+    if snapDetected then
+        anomalyScores.SnapLoop = snapScore
+        trustXZ = trustXZ - config.Weights.SnapLoop * math.min(1, snapScore)
+        trustY = trustY - (config.Weights.SnapLoop * 0.4) * math.min(1, snapScore)
+    end
+    local stateBlend = (1 - config.Weights.State) + (config.Weights.State * stateScore)
+    trustXZ = trustXZ * stateBlend
+    trustY = trustY * stateBlend
+    if anomalyScores.SpeedXZ > 1.5 then table.insert(anomalies, "SpeedXZ") end
+    if anomalyScores.SpeedY > 1.5 then table.insert(anomalies, "SpeedY") end
+    if anomalyScores.AccelXZ > 1.5 then table.insert(anomalies, "AccelXZ") end
+    if anomalyScores.AccelY > 1.5 then table.insert(anomalies, "AccelY") end
+    if anomalyScores.DirectionXZ > 1.5 then table.insert(anomalies, "DirectionXZ") end
+    if anomalyScores.JitterXZ > 1.5 then table.insert(anomalies, "JitterXZ") end
+    if anomalyScores.SnapLoop > 0.45 then table.insert(anomalies, "SnapLoop") end
+    trustXZ = clamp(trustXZ, 0.1, 1.0)
+    trustY = clamp(trustY, 0.1, 1.0)
+    local overallTrust = clamp((trustXZ * 0.65) + (trustY * 0.35), 0.1, 1.0)
+    local likelyFakePos = (overallTrust < 0.45 or trustXZ < 0.40 or anomalyScores.SnapLoop > 0.7)
+    return overallTrust, trustXZ, trustY, anomalies, snapScore, likelyFakePos
+end
+
+local function predictObservedPosition(history, trustOverall, trustXZ, trustY, config)
+    if #history == 0 then return nil end
+    if #history == 1 then return history[1].pos end
+    local anchorIdx = #history
+    for i = #history, 1, -1 do
+        if history[i].trust >= config.AnchorTrustThreshold then
+            anchorIdx = i
+            break
+        end
+    end
+    local anchor = history[anchorIdx]
+    local _, velXZ, velY = calculateRobustVelocity(history, 4, config)
+    local predTime = 0.04 + (1 - trustOverall) * 0.08
+    predTime = math.min(config.MaxPredictionTime, predTime)
+    local predXZ = xz(anchor.pos) + velXZ * predTime
+    local predY = anchor.pos.Y + (velY * predTime)
+    if trustY < 0.45 then
+        local sumY = 0
+        local totalY = 0
+        local currentTime = history[#history].time
+        for i = math.max(1, #history - 3), #history do
+            local h = history[i]
+            local age = currentTime - h.time
+            local w = math.exp(-age * 8) * math.max(0.05, h.trust)
+            sumY = sumY + h.pos.Y * w
+            totalY = totalY + w
+        end
+        if totalY > 0 then
+            local smoothedY = sumY / totalY
+            local alpha = clamp(trustY * 2.2, 0, 1)
+            predY = smoothedY + (predY - smoothedY) * alpha
+        end
+    end
+    if trustXZ < 0.45 then
+        local sumXZ = Vector3.zero
+        local totalXZ = 0
+        local currentTime = history[#history].time
+        for i = math.max(1, #history - 3), #history do
+            local h = history[i]
+            local age = currentTime - h.time
+            local w = math.exp(-age * 8) * math.max(0.05, h.trust)
+            sumXZ = sumXZ + xz(h.pos) * w
+            totalXZ = totalXZ + w
+        end
+        if totalXZ > 0 then
+            local smoothedXZ = sumXZ / totalXZ
+            local alpha = clamp(trustXZ * 2.2, 0, 1)
+            predXZ = smoothedXZ:Lerp(predXZ, alpha)
+        end
+    end
+    return Vector3.new(predXZ.X, predY, predXZ.Z)
+end
+
+local Analyzer = {
+    Tracked = {},
+    HistorySize = 18,
+    MinSamples = 6,
+    MaxPredictionTime = 0.12,
+    AnchorTrustThreshold = 0.75,
+    BaseSpeedThresholdXZ = 64,
+    BaseSpeedThresholdY = 90,
+    MaxSampleDt = 0.50,
+    MinSampleDt = 0.001,
+    MaxSpeedOutlier = 260,
+    MaxReasonableStep = 60,
+    Weights = {
+        SpeedXZ = 0.20,
+        SpeedY = 0.10,
+        AccelXZ = 0.16,
+        AccelY = 0.08,
+        DirectionXZ = 0.14,
+        JitterXZ = 0.14,
+        SnapLoop = 0.20,
+        Raycast = 0.12,
+        State = 0.10,
+    },
+    UseVisualization = false,
+    VisualizeTargets = {},
+    VizThrottle = 0.20,
+    VizLifetime = 0.35,
+}
+
+function Analyzer:Visualize(player, pos, info)
+    local data = self.Tracked[player]
+    if not data then return end
+    local now = tick()
+    if data.lastVizTime and (now - data.lastVizTime) < self.VizThrottle then return end
+    data.lastVizTime = now
+    local trust = info.trust
+    local color = trust > 0.7 and Color3.fromRGB(0, 255, 0)
+        or trust > 0.45 and Color3.fromRGB(255, 255, 0)
+        or Color3.fromRGB(255, 0, 0)
+    local part = Instance.new("Part")
+    part.Size = Vector3.new(1.1, 1.1, 1.1)
+    part.Color = color
+    part.Material = Enum.Material.Neon
+    part.Position = pos
+    part.Anchored = true
+    part.CanCollide = false
+    part.CanTouch = false
+    part.CanQuery = false
+    part.Parent = Workspace
+    Debris:AddItem(part, self.VizLifetime)
+    local gui = Instance.new("BillboardGui")
+    gui.Size = UDim2.new(0, 150, 0, 42)
+    gui.StudsOffset = Vector3.new(0, 2.2, 0)
+    gui.AlwaysOnTop = true
+    gui.Adornee = part
+    gui.Parent = part
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.new(1, 1, 1)
+    label.TextStrokeTransparency = 0
+    label.Font = Enum.Font.SourceSansBold
+    label.TextScaled = true
+    label.Text = string.format("T: %.2f | XZ: %.2f | Y: %.2f\n%s%s",
+        info.trust, info.trustXZ, info.trustY, info.airState,
+        (#info.anomalies > 0 and (" | " .. table.concat(info.anomalies, ",")) or ""))
+    label.Parent = gui
+end
+
+function Analyzer:Analyze(player)
+    local root, humanoid = getRootAndHumanoid(player)
+    if not root or not humanoid then
+        return nil, buildInfo(nil, {trust=0,trustXZ=0,trustY=0,anomalies={"NoCharacter"},airState="Unknown",isLikelyFakePos=false,ping=0,historySize=0})
+    end
+    local currentPos = root.Position
+    local currentTime = tick()
+    local ping = player:GetNetworkPing()
+    local airState = getAirState(humanoid)
+    if not self.Tracked[player] then
+        self.Tracked[player] = {
+            history = {},
+            lastObserved = currentPos,
+            lastValidPos = currentPos,
+            lastTrust = 1.0,
+            lastTrustXZ = 1.0,
+            lastTrustY = 1.0,
+            lastSnapScore = 0,
+            lastRaycastValid = 1.0,
+            lastAirState = airState,
+            lastLikelyFakePos = false,
+            stableFrames = 0,
+            suspiciousFrames = 0,
+            lastVizTime = 0,
+        }
+    end
+    local data = self.Tracked[player]
+    local history = data.history
+    table.insert(history, {pos=currentPos, time=currentTime, trust=data.lastTrust, ping=ping})
+    if #history > self.HistorySize then table.remove(history, 1) end
+    local trust, trustXZ, trustY, anomalies, snapScore, likelyFakePos = analyzeMovementPattern(history, player, self)
+    if data.lastValidPos and trust > 0.3 then
+        local raycastScore = validatePositionWithRaycast(player, data.lastValidPos, currentPos, humanoid)
+        data.lastRaycastValid = raycastScore
+        local rayBlend = (1 - self.Weights.Raycast) + (self.Weights.Raycast * raycastScore)
+        trustXZ = clamp(trustXZ * rayBlend, 0.1, 1.0)
+        trust = clamp((trustXZ * 0.65) + (trustY * 0.35), 0.1, 1.0)
+    else
+        data.lastRaycastValid = 1.0
+    end
+    history[#history].trust = trust
+    data.lastTrust = trust
+    data.lastTrustXZ = trustXZ
+    data.lastTrustY = trustY
+    data.lastSnapScore = snapScore
+    data.lastAirState = airState
+    data.lastLikelyFakePos = likelyFakePos
+    local observedPos = predictObservedPosition(history, trust, trustXZ, trustY, self) or currentPos
+    data.lastObserved = observedPos
+    if trust > 0.72 and trustXZ > 0.70 then
+        data.stableFrames = math.min(data.stableFrames + 1, 24)
+        data.suspiciousFrames = math.max(data.suspiciousFrames - 1, 0)
+        if trust > 0.84 and not likelyFakePos then data.lastValidPos = currentPos end
+    else
+        data.suspiciousFrames = math.min(data.suspiciousFrames + 1, 12)
+        data.stableFrames = math.max(data.stableFrames - 1, 0)
+    end
+    local info = buildInfo(data, {
+        trust=trust, trustXZ=trustXZ, trustY=trustY, snapScore=snapScore,
+        raycastTrust=data.lastRaycastValid, airState=airState, isLikelyFakePos=likelyFakePos,
+        anomalies=anomalies, ping=ping, historySize=#history,
+    })
+    if self.UseVisualization and (not next(self.VisualizeTargets) or self.VisualizeTargets[player]) then
+        self:Visualize(player, observedPos, info)
+    end
+    return observedPos, info
+end
+
+function GetObservedPosition(player, options)
+    options = options or {}
+    if options.forceAnalyze then return Analyzer:Analyze(player) end
+    local data = Analyzer.Tracked[player]
+    if data and data.lastObserved then
+        return data.lastObserved, buildInfo(data, {
+            trust=data.lastTrust, trustXZ=data.lastTrustXZ, trustY=data.lastTrustY,
+            snapScore=data.lastSnapScore, raycastTrust=data.lastRaycastValid,
+            airState=data.lastAirState, isLikelyFakePos=data.lastLikelyFakePos,
+            anomalies={}, ping=0, historySize=#data.history,
+        })
+    end
+    return Analyzer:Analyze(player)
+end
+
+function IsLikelyFakePos(player)
+    local _, info = GetObservedPosition(player, { forceAnalyze = true })
+    return info.isLikelyFakePos, info
+end
+
+local AntiFakeGroup = Tabs.Player:AddRightGroupbox('Anti FakePos')
+
+AntiFakeGroup:AddToggle('AntiFakePosToggle', {
+    Text = 'Enable Anti FakePos', Default = false,
+    Tooltip = 'Detect and resolve fake position targets',
+    Callback = function(Value)
+        Settings.AntiFakePos.Enabled = Value
+        Analyzer.UseVisualization = Value and Settings.AntiFakePos.ShowVisuals
+    end
+})
+
+AntiFakeGroup:AddSlider('MinTrustSlider', {
+    Text = 'Minimum Trust', Default = 60, Min = 30, Max = 90, Suffix = '%', Rounding = 1,
+    Tooltip = 'Minimum trust required to shoot',
+    Callback = function(Value) Settings.AntiFakePos.MinTrust = Value / 100 end
+})
+
+AntiFakeGroup:AddToggle('ShowVisualsToggle', {
+    Text = 'Show Visual Indicators', Default = false,
+    Tooltip = 'Show colored parts indicating trust level',
+    Callback = function(Value)
+        Settings.AntiFakePos.ShowVisuals = Value
+        Analyzer.UseVisualization = Settings.AntiFakePos.Enabled and Value
+    end
+})
+
+AntiFakeGroup:AddToggle('DebugModeToggle', {
+    Text = 'Debug Mode', Default = false,
+    Tooltip = 'Print trust info to console',
+    Callback = function(Value) Settings.AntiFakePos.DebugMode = Value end
+})
+
+AntiFakeGroup:AddDivider()
+AntiFakeGroup:AddLabel('Current Target Info')
+
+local trustLabel = AntiFakeGroup:AddLabel('Trust: N/A')
+local trustXZLabel = AntiFakeGroup:AddLabel('XZ Trust: N/A')
+local trustYLabel = AntiFakeGroup:AddLabel('Y Trust: N/A')
+local airStateLabel = AntiFakeGroup:AddLabel('Air State: N/A')
+local fakePosLabel = AntiFakeGroup:AddLabel('FakePos: N/A')
